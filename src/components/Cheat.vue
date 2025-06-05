@@ -1,5 +1,24 @@
 <template>
     <div class="chat-app">
+        <!-- 页面加载指示器 -->
+        <div v-if="isLoadingApp" class="app-loading">
+            <div class="loading-spinner"></div>
+            <p>{{ ok ? '正在加载智慧养老助手...' : '智慧养老助手加载失败，请检查网络连接或联系管理员' }}</p>
+        </div>
+
+        <!-- 演示视频用,你可以替换成自己的导航栏 -->
+        <div class="app-header">
+            <div class="header-left">
+                <button class="back-button">
+                    <i>{{ '<' }}</i>
+                </button>
+            </div>
+            <div class="header-center">
+                <h1><i class="fas fa-robot"></i> 智慧养老助手</h1>
+                <p>随时为您解答问题，提供专业建议</p>
+            </div>
+        </div>
+
         <div class="chat-container" ref="chatContainer">
             <!-- 消息列表 -->
             <div v-for="(message, index) in messages" :key="index">
@@ -7,6 +26,7 @@
                     <div class="message-head-portrait">
                         <div v-if="message.sender === 'user'" class="avatar">
                             <img src="@/assets/icon/avatar.png" alt="">
+                            <!-- 可以从vuex拿userInfo渲染用户头像 -->
                         </div>
                         <div v-else class="avatar">
                             <img src="@/assets/icon/AI.jpg" alt="">
@@ -17,6 +37,7 @@
                         :class="message.sender === 'user' ? 'message-content message-user' : 'message-content message-ai'">
                         <div class="sender-name" :class="{ 'sender-name-user': message.sender === 'user' }">
                             {{ message.sender === 'user' ? '我' : 'AI助手' }}
+                            <!-- 可以从vuex拿userInfo渲染用户名 -->
                         </div>
                         <div class="message-bubble">
                             {{ message.content }}
@@ -26,10 +47,12 @@
                 </div>
             </div>
 
-            <!-- 加载中指示器 -->
-            <!-- <div v-if="isLoading" class="loading-indicator">
-                <div class="loading-spinner"></div>
-            </div> -->
+            <!-- 输入中指示器 -->
+            <div class="typing-indicator" v-if="isTyping">
+                <span></span>
+                <span></span>
+                <span></span>
+            </div>
 
             <!-- 流式响应显示 -->
             <div v-if="isStreaming" class="streaming-message">
@@ -66,23 +89,70 @@ export default {
     name: "AIChat",
     data () {
         return {
-            newMessage: "",
-            messages: [],
-            isLoading: false,
-            isStreaming: false,
-            streamingContent: "",
-            controller: null,
-            chatId: null,
-            errorDisplayed: false,
+            newMessage: "", // 输入框内容
+            messages: [], // 消息列表
+            isLoading: false, // 加载状态
+            isStreaming: false, // 流式响应状态
+            isTyping: false, // 输入中指示器状态
+            streamingContent: "", // 流式响应内容
+            controller: null, // 控制器
+            errorDisplayed: false, // 错误提示状态
+            hasReceivedData: false, // 标记是否已接收数据
+            isLoadingApp: true, // 应用加载状态
+            healthCheckTimeout: null, // 健康检查超时定时器
+            appLoadTimeout: 3000, // 保底加载时间(毫秒)
+            ok: true
         };
     },
     methods: {
+        checkAppHealth () {
+            const apiUrl = "http://10.138.50.151:8000/api/health";
+
+            fetch(apiUrl)
+                .then(response => {
+                    if (!response.ok) {
+                        throw new Error(`健康检查失败: ${response.status}`);
+                    }
+                    return response.json();
+                })
+                .then(data => {
+                    if (data.status === "ok") {
+                        this.handleHealthCheckSuccess();
+                    } else {
+                        throw new Error("健康检查返回非ok状态");
+                    }
+                })
+                .catch(error => {
+                    this.handleHealthCheckError(error);
+                });
+        },
+
+        handleHealthCheckSuccess () {
+            // 即使提前收到响应，也等待保底时间
+            clearTimeout(this.healthCheckTimeout);
+            this.healthCheckTimeout = setTimeout(() => {
+                this.isLoadingApp = false;
+            }, this.appLoadTimeout);
+        },
+
+        handleHealthCheckError (error) {
+            console.error("健康检查错误:", error);
+            clearTimeout(this.healthCheckTimeout);
+            this.isLoadingApp = true; // 保持蒙版
+
+            this.ok = false
+            console.log('弹错误提示');
+        },
+
         sendMessage () {
+            let message = this.newMessage.trim();
             if (!this.newMessage.trim() || this.isLoading) return;
 
             // 重置状态
             this.errorDisplayed = false;
-            this.streamingContent = ""; // 重置流式内容
+            this.streamingContent = "";
+            this.hasReceivedData = false;
+            this.isTyping = true; // 显示输入中指示器
 
             // 添加用户消息
             const userMsg = {
@@ -91,16 +161,16 @@ export default {
                 time: this.getCurrentTime(),
             };
             this.messages.push(userMsg);
+            this.newMessage = "";
 
             // 清空输入框
-            this.newMessage = "";
             this.$nextTick(() => {
                 this.scrollToBottom();
             });
 
             // 开始加载状态
             this.isLoading = true;
-            this.isStreaming = true;
+
 
             // 取消之前的请求
             if (this.controller) {
@@ -115,16 +185,17 @@ export default {
             fetchEventSource("http://10.138.50.151:8000/api/chat", {
                 method: "POST",
                 headers: {
-                    "Accept": "application/json",
                     "Content-Type": "application/json",
                 },
-                body: JSON.stringify({ user_content: this.newMessage }),
+                body: JSON.stringify({ user_content: message }),
                 signal,
                 onmessage: (msg) => {
                     this.handleMessage(msg);
                 },
                 onerror: (err) => {
                     this.handleError(err);
+                    this.controller.abort();
+                    throw err
                 },
                 onclose: () => {
                     this.handleStreamClose();
@@ -133,15 +204,14 @@ export default {
         },
 
         handleMessage (msg) {
+            if (!this.hasReceivedData) {
+                this.isTyping = false; // 收到第一条数据后隐藏输入指示器
+                this.isStreaming = true; // 显示流式响应
+                this.hasReceivedData = true; // 标记已接收数据
+            }
+
             try {
                 const res = JSON.parse(msg.data);
-
-                // 处理工具调用（如果有）
-                if (res.content === "tool_calls" && res.new_completion_id) {
-                    this.chatId = res.new_completion_id;
-                    this.sendMessage(); // 递归调用处理工具响应
-                    return;
-                }
 
                 // 忽略无效内容
                 if (!res.content || res.content === "undefined") {
@@ -187,6 +257,7 @@ export default {
         },
 
         handleError (err) {
+            this.isTyping = false; // 错误时隐藏输入指示器
             if (!this.errorDisplayed) {
                 this.errorDisplayed = true;
                 this.isLoading = false;
@@ -195,7 +266,6 @@ export default {
                 this.addErrorMsg("抱歉，请求处理失败，请稍后再试。");
             }
         },
-
         addErrorMsg (content) {
             const errorMsg = {
                 sender: "AI",
@@ -224,22 +294,19 @@ export default {
         if (this.controller) {
             this.controller.abort();
         }
+        clearTimeout(this.healthCheckTimeout);
     },
     mounted () {
-        this.$nextTick(() => {
-            this.scrollToBottom();
-        });
+        this.checkAppHealth();
     },
 };
 </script>
 
 <style scoped>
-/* 基础样式 */
 * {
     margin: 0;
     padding: 0;
     box-sizing: border-box;
-    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, 'Open Sans', 'Helvetica Neue', sans-serif;
 }
 
 body {
@@ -262,6 +329,45 @@ body {
     padding: 16px;
     text-align: center;
     box-shadow: 0 3px 10px rgba(0, 0, 0, 0.1);
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    position: relative;
+}
+
+.header-left {
+    position: absolute;
+    left: 16px;
+    top: 50%;
+    transform: translateY(-50%);
+}
+
+.header-center {
+    flex: 1;
+    text-align: center;
+}
+
+.back-button {
+    background: none;
+    border: none;
+    color: white;
+    font-size: 34px;
+    cursor: pointer;
+    padding: 8px;
+    border-radius: 50%;
+    transition: background-color 0.3s;
+}
+
+.back-button:hover {
+    background-color: rgba(255, 255, 255, 0.2);
+}
+
+.back-button:active {
+    transform: scale(0.95);
+}
+
+.back-button i {
+    margin: 0;
 }
 
 .app-header h1 {
@@ -272,6 +378,34 @@ body {
 .app-header p {
     font-size: 0.75rem;
     opacity: 0.9;
+}
+
+.app-loading {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    align-items: center;
+    background: #f5f7fb;
+    z-index: 1000;
+}
+
+.app-loading p {
+    margin-top: 16px;
+    color: #6c757d;
+    font-size: 14px;
+}
+
+.chat-content {
+    position: relative;
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    height: 100vh;
 }
 
 .chat-container {
@@ -306,8 +440,8 @@ body {
 }
 
 .loading-spinner {
-    width: 16px;
-    height: 16px;
+    width: 32px;
+    height: 32px;
     border: 2px solid rgba(143, 148, 251, 0.3);
     border-top-color: #8f94fb;
     border-radius: 50%;
@@ -422,6 +556,7 @@ body {
     align-items: center;
     box-shadow: 0 3px 10px rgba(78, 84, 200, 0.25);
     user-select: none;
+    -webkit-tap-highlight-color: transparent
 }
 
 .send-button:active {
